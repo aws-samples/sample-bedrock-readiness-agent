@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Bedrock Readiness Agent - AgentCore Runtime Deployment
+
+Parameters:
+  AgentName:
+    Type: String
+    Default: bedrock-readiness-agent
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+Resources:
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AgentName}-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      ManagedPolicyArns:
+        - !Ref AgentReadOnlyPolicy
+
+  AgentReadOnlyPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AgentName}-read-only-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: IAMReadOnly
+            Effect: Allow
+            Action:
+              - iam:ListRoles
+              - iam:ListAttachedRolePolicies
+              - iam:ListRolePolicies
+              - iam:GetRolePolicy
+              - iam:GetPolicy
+              - iam:GetPolicyVersion
+            Resource: "*"
+          - Sid: BedrockReadOnly
+            Effect: Allow
+            Action:
+              - bedrock:List*
+              - bedrock:Get*
+            Resource: "*"
+          - Sid: CloudWatchReadOnly
+            Effect: Allow
+            Action:
+              - cloudwatch:GetMetricData
+              - cloudwatch:ListMetrics
+              - cloudwatch:DescribeAlarms
+            Resource: "*"
+          - Sid: EC2ReadOnly
+            Effect: Allow
+            Action:
+              - ec2:DescribeVpcEndpoints
+            Resource: "*"
+          - Sid: ServiceQuotasReadOnly
+            Effect: Allow
+            Action:
+              - servicequotas:ListServiceQuotas
+              - servicequotas:GetServiceQuota
+            Resource: "*"
+          - Sid: CostExplorerReadOnly
+            Effect: Allow
+            Action:
+              - ce:GetCostAndUsage
+            Resource: "*"
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+            Resource:
+              - "arn:aws:bedrock:*::foundation-model/*"
+              - "arn:aws:bedrock:*:*:inference-profile/*"
+
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::AgentRuntime
+    Properties:
+      AgentRuntimeName: !Ref AgentName
+      Description: "Production readiness assessment for Amazon Bedrock workloads"
+      RoleArn: !GetAtt AgentExecutionRole.Arn
+      AgentRuntimeConfiguration:
+        Python:
+          EntryPoint: agent.py
+          Requirements: requirements.txt
+
+Outputs:
+  AgentRuntimeArn:
+    Value: !GetAtt AgentRuntime.Arn
+    Description: ARN of the deployed readiness agent
+  ExecutionRoleArn:
+    Value: !GetAtt AgentExecutionRole.Arn
+    Description: ARN of the agent's execution role

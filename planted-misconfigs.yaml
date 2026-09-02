@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bedrock Readiness Agent - Planted Misconfigurations
+  Deploys a deliberately misconfigured environment for the agent to assess.
+  DO NOT deploy in production accounts.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into (for VPC endpoint checks)
+
+Resources:
+  # --- D1: IAM Governance Misconfigs ---
+
+  # Misconfigured role with wildcard bedrock:* (should be scoped)
+  WildcardBedrockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: demo-bedrock-wildcard-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OverlyPermissiveBedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "bedrock:*"
+                Resource: "*"
+              - Effect: Allow
+                Action: "bedrock-runtime:*"
+                Resource: "*"
+
+  # Role with bedrock-mantle wildcard (OpenAI surface)
+  WildcardMantleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: demo-mantle-wildcard-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OverlyPermissiveMantle
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "bedrock-mantle:*"
+                Resource: "*"
+
+  # Role with proper scoping (agent should NOT flag this)
+  ProperlyScoptedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: demo-bedrock-scoped-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScopedBedrock
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.claude-*"
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-*"
+
+  # --- D2: ZDR ---
+  # ZDR is account-level setting, not deployable via CFN.
+  # The agent checks via API - if not enabled, it flags it.
+  # Workshop instruction: "Do NOT enable ZDR before running the agent"
+
+  # --- D3: Quota Headroom ---
+  # Quotas are account-level, not deployable.
+  # Agent checks throttle metrics - we simulate with a Lambda that generates load.
+
+  ThrottleGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: demo-bedrock-throttle-generator
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ThrottleGeneratorRole.Arn
+      Timeout: 60
+      # Bound blast radius: this quota-consuming demo function is capped at one
+      # concurrent execution. The sequential range(100) loop still produces the
+      # throttle metrics the D3 dimension needs; this only prevents accidental
+      # repeated triggers from piling up parallel quota burn.
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          """
+          Generates rapid Bedrock calls to trigger throttling.
+          Run this BEFORE the agent assessment to create throttle metrics.
+          Uses a model that will hit quota quickly.
+          """
+          import boto3
+          import json
+
+          def handler(event, context):
+              bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
+              throttle_count = 0
+              success_count = 0
+
+              for i in range(100):
+                  try:
+                      bedrock.invoke_model(
+                          modelId='anthropic.claude-3-haiku-20240307-v1:0',
+                          body=json.dumps({
+                              "anthropic_version": "bedrock-2023-05-31",
+                              "max_tokens": 10,
+                              "messages": [{"role": "user", "content": f"Say {i}"}]
+                          })
+                      )
+                      success_count += 1
+                  except bedrock.exceptions.ThrottlingException:
+                      throttle_count += 1
+                  except Exception as e:
+                      if "ThrottlingException" in str(e):
+                          throttle_count += 1
+
+              return {
+                  "success": success_count,
+                  "throttled": throttle_count,
+                  "message": f"Generated {throttle_count} throttle events for agent to detect"
+              }
+
+  ThrottleGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: demo-throttle-generator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: "*"
+
+  # --- D6: Observability ---
+  # Intentionally NO alarms created (agent should flag this)
+  # Intentionally NO VPC endpoints created (agent should flag all 5 missing)
+  # The VpcId parameter exists but we create nothing with it - that's the point.
+
+  # --- Control: One alarm that EXISTS (to verify agent doesn't false-positive) ---
+  SingleNonBedrockAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: demo-non-bedrock-alarm
+      AlarmDescription: "This is NOT a Bedrock alarm - agent should not count it"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+
+Outputs:
+  WildcardRoleArn:
+    Value: !GetAtt WildcardBedrockRole.Arn
+    Description: "MISCONFIGURED: Role with bedrock:* wildcard"
+
+  MantleRoleArn:
+    Value: !GetAtt WildcardMantleRole.Arn
+    Description: "MISCONFIGURED: Role with bedrock-mantle:* wildcard"
+
+  ScopedRoleArn:
+    Value: !GetAtt ProperlyScoptedRole.Arn
+    Description: "CORRECT: Properly scoped role (should NOT be flagged)"
+
+  ThrottleGeneratorArn:
+    Value: !GetAtt ThrottleGeneratorFunction.Arn
+    Description: "Run this Lambda before assessment to generate throttle metrics"
+
+  ExpectedFindings:
+    Value: !Sub |
+      Expected agent findings after deployment:
+      - D1 HIGH: 2 roles with wildcard bedrock:*/bedrock-mantle:* actions
+      - D1 HIGH: Zero guardrails configured
+      - D2 CRITICAL: ZDR not enabled (if account ZDR is off)
+      - D3 HIGH: Throttle events detected (after running ThrottleGenerator)
+      - D3 MEDIUM: No CRIS enabled despite throttling
+      - D6 HIGH: Zero Bedrock CloudWatch alarms
+      - D6 MEDIUM: Missing all 5 VPC endpoints
+    Description: "What the agent should find"
